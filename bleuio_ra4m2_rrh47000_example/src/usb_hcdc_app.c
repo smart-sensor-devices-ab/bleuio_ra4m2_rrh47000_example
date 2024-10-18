@@ -86,6 +86,7 @@ void usb_hcdc_task(void)
     uint32_t gpt_desired_period_ms          = RESET_VALUE;
     uint64_t period_counts                  = RESET_VALUE;
     uint32_t pclkd_freq_hz                  = RESET_VALUE;
+    size_t msg_len = 0;
     static usb_event_info_t *event_info = NULL;
     BaseType_t err_queue = pdFALSE;
     memset(&g_serial_state, RESET_VALUE, sizeof(g_serial_state));
@@ -190,101 +191,121 @@ void usb_hcdc_task(void)
         }
 
         /* Receive message from queue and analyzing the received message*/
-         err_queue= xQueueReceive(g_usb_queue, &event_info,(portMAX_DELAY));
+         err_queue= xQueueReceive(g_usb_queue, &event_info,(2000));
          /* Handle error */
-         if(pdTRUE != err_queue)
+         if(pdTRUE == err_queue)
          {
-             handle_error (err_queue, "Error in receiving USB event message through queue");
+
+            switch (event_info->event)
+            {
+                case USB_STATUS_CONFIGURED:
+                {
+                    /* CDC Class request "SetLineCoding" */
+                    set_line_coding (&g_basic_ctrl, event_info->device_address);
+                    APP_PRINT("\r\nUSB_STATUS_CONFIGURED");
+                }
+                break;
+
+                case USB_STATUS_READ_COMPLETE:
+                {
+                    /* CDC class communication data process */
+                    usb_data_process(event_info);
+                }
+                break;
+
+                case USB_STATUS_WRITE_COMPLETE:
+                {
+    //                APP_PRINT("\r\nUSB_STATUS_WRITE_COMPLETE");
+                }
+                break;
+
+                case USB_STATUS_REQUEST_COMPLETE:
+                {
+                    /* Check Complete request "SetLineCoding" */
+                    if (USB_CDC_SET_LINE_CODING == (event_info->setup.request_type & USB_BREQUEST))
+                    {
+                        APP_PRINT("\r\nUSB_CDC_SET_LINE_CODING REQ");
+                        /* Class notification "SerialState" receive start */
+                        set_control_line_state (&g_basic_ctrl, event_info->device_address);
+                    }
+                    /* Check Complete request "SetControlLineState" */
+                    else if (USB_CDC_SET_CONTROL_LINE_STATE == (event_info->setup.request_type & USB_BREQUEST))
+                    {
+                        APP_PRINT("\r\nUSB_CDC_SET_CONTROL_LINE_STATE REQ");
+                        /* CDC Class request "SetLineCoding" */
+                        get_line_coding (&g_basic_ctrl, event_info->device_address);
+                    }
+                    else if (USB_CDC_GET_LINE_CODING == (event_info->setup.request_type & USB_BREQUEST))
+                    {
+                        /*Read device info*/
+                        err = R_USB_HCDC_DeviceInfoGet(&g_basic_ctrl, &dev_info, event_info->device_address);
+                        APP_PRINT("\r\nUSB_CDC_GET_LINE_CODING REQ");
+                        if (FSP_SUCCESS != err)
+                        {
+                            handle_error (err, "**R_USB_HCDC_DeviceInfoGet API FAILED**");
+                        }
+                        APP_PRINT("\r\n\r\n PID %04X", dev_info.product_id);
+                        APP_PRINT("\r\n SUBCLASS %02X", dev_info.subclass);
+                        APP_PRINT("\r\n VID %04X\r\n", dev_info.vendor_id);
+                        TURN_RED_OFF;
+                        /*Check that BleuIO is out of bootloader mode*/
+                        if((dev_info.product_id == 0x6002) && (dev_info.vendor_id == 0x2DCF))
+                        {
+                            /* Report receive start */
+                            R_USB_Read (&g_basic_ctrl, g_rcv_buf, CDC_READ_DATA_LEN,
+                                                  event_info->device_address);
+                            /* Handle Error */
+                            if (FSP_SUCCESS != err)
+                            {
+                                handle_error (err,"**R_USB_Read API FAILED**");
+                            }
+                            dev_addr = event_info->device_address;
+                            err = R_USB_Write (&g_basic_ctrl, g_snd_buf, strlen((char *)BLEUIO_CMD_ADV_START),
+                                         event_info->device_address);
+                            if (FSP_SUCCESS != err)
+                            {
+                                handle_error (err, "**R_USB_Write API FAILED**");
+                            }
+                            dongle_booted = true;
+                        }
+                    }
+                    else
+                    {
+                        /* Not support request */
+                    }
+                }
+                break;
+
+                default:
+                {
+                    APP_PRINT("\r\nUnknown operation: %02X", event_info->event);
+                    /* No operation to do*/
+                }
+                break;
+            }
          }
 
-        switch (event_info->event)
+        if (update_adv_data)
         {
-            case USB_STATUS_CONFIGURED:
+            update_adv_data = false;
+            /* Update Advertising*/
+            sprintf((char *)g_snd_buf, "%s09:FF:36:00:%02X:%02X:%02X:%02X:%02X:%02X\r",
+                    (char *)BLEUIO_CMD_ADVDATA,
+                    CO2_adv_1, CO2_adv_2,
+                    Temp_adv_1, Temp_adv_2,
+                    Hum_adv_1, Hum_adv_2);
+            msg_len = strlen((char *)g_snd_buf);
+            err = R_USB_Write (&g_basic_ctrl, g_snd_buf, msg_len, event_info->device_address);
+            if (FSP_SUCCESS != err)
             {
-                /* CDC Class request "SetLineCoding" */
-                set_line_coding (&g_basic_ctrl, event_info->device_address);
-                APP_PRINT("\r\nUSB_STATUS_CONFIGURED");
+                handle_error (err, "**R_USB_Write API FAILED**");
             }
-            break;
-
-            case USB_STATUS_READ_COMPLETE:
-            {
-                /* CDC class communication data process */
-                usb_data_process(event_info);
-            }
-            break;
-
-            case USB_STATUS_WRITE_COMPLETE:
-            {
-//                APP_PRINT("\r\nUSB_STATUS_WRITE_COMPLETE");
-            }
-            break;
-
-            case USB_STATUS_REQUEST_COMPLETE:
-            {
-                /* Check Complete request "SetLineCoding" */
-                if (USB_CDC_SET_LINE_CODING == (event_info->setup.request_type & USB_BREQUEST))
-                {
-                    APP_PRINT("\r\nUSB_CDC_SET_LINE_CODING REQ");
-                    /* Class notification "SerialState" receive start */
-                    set_control_line_state (&g_basic_ctrl, event_info->device_address);
-                }
-                /* Check Complete request "SetControlLineState" */
-                else if (USB_CDC_SET_CONTROL_LINE_STATE == (event_info->setup.request_type & USB_BREQUEST))
-                {
-                    APP_PRINT("\r\nUSB_CDC_SET_CONTROL_LINE_STATE REQ");
-                    /* CDC Class request "SetLineCoding" */
-                    get_line_coding (&g_basic_ctrl, event_info->device_address);
-                }
-                else if (USB_CDC_GET_LINE_CODING == (event_info->setup.request_type & USB_BREQUEST))
-                {
-                    /*Read device info*/
-                    err = R_USB_HCDC_DeviceInfoGet(&g_basic_ctrl, &dev_info, event_info->device_address);
-                    APP_PRINT("\r\nUSB_CDC_GET_LINE_CODING REQ");
-                    if (FSP_SUCCESS != err)
-                    {
-                        handle_error (err, "**R_USB_HCDC_DeviceInfoGet API FAILED**");
-                    }
-                    APP_PRINT("\r\n\r\n PID %04X", dev_info.product_id);
-                    APP_PRINT("\r\n SUBCLASS %02X", dev_info.subclass);
-                    APP_PRINT("\r\n VID %04X\r\n", dev_info.vendor_id);
-                    TURN_RED_OFF;
-                    /*Check that BleuIO is out of bootloader mode*/
-                    if((dev_info.product_id == 0x6002) && (dev_info.vendor_id == 0x2DCF))
-                    {
-                        /* Report receive start */
-                        R_USB_Read (&g_basic_ctrl, g_rcv_buf, CDC_READ_DATA_LEN,
-                                              event_info->device_address);
-                        /* Handle Error */
-                        if (FSP_SUCCESS != err)
-                        {
-                            handle_error (err,"**R_USB_Read API FAILED**");
-                        }
-                        dev_addr = event_info->device_address;
-                        err = R_USB_Write (&g_basic_ctrl, g_snd_buf, strlen((char *)BLEUIO_CMD_ADV_START),
-                                     event_info->device_address);
-                        if (FSP_SUCCESS != err)
-                        {
-                            handle_error (err, "**R_USB_Write API FAILED**");
-                        }
-                        dongle_booted = true;
-                    }
-                }
-                else
-                {
-                    /* Not support request */
-                }
-            }
-            break;
-
-            default:
-            {
-                APP_PRINT("\r\nUnknown operation: %02X", event_info->event);
-                /* No operation to do*/
-            }
-            break;
+            APP_PRINT ("\r\n\r\nRRH47000 CO2: %u", co2);
+            APP_PRINT ("\r\nRRH47000 Temp: %u.%u", temp_wh, temp_fr);
+            APP_PRINT ("\r\nRRH47000 Hum: %u.%u\r\n", hum_wh, hum_fr);
         }
-    }
+
+    } // While loop end
 }
  /* End of function main_task() */
 
@@ -456,37 +477,6 @@ void usb_data_process(usb_event_info_t *event_info)
                 adv_started = true;
                 TURN_GREEN_ON;
                 TURN_RED_OFF;
-            }
-            else if (update_adv_data)
-            {
-                update_adv_data = false;
-//                /* Update Advertising*/
-                sprintf((char *)g_snd_buf, "%s09:FF:36:00:%02X:%02X:%02X:%02X:%02X:%02X\r",
-                        (char *)BLEUIO_CMD_ADVDATA,
-                        CO2_adv_1, CO2_adv_2,
-                        Temp_adv_1, Temp_adv_2,
-                        Hum_adv_1, Hum_adv_2);
-                msg_len = strlen((char *)g_snd_buf);
-                err = R_USB_Write (&g_basic_ctrl, g_snd_buf, msg_len, event_info->device_address);
-                if (FSP_SUCCESS != err)
-                {
-                    handle_error (err, "**R_USB_Write API FAILED**");
-                }
-                APP_PRINT ("\r\n\r\nRRH47000 CO2: %u", co2);
-                APP_PRINT ("\r\nRRH47000 Temp: %u.%u", temp_wh, temp_fr);
-                APP_PRINT ("\r\nRRH47000 Hum: %u.%u\r\n", hum_wh, hum_fr);
-            }
-            else
-            {
-                sprintf((char *)g_snd_buf, "\r\n");
-                msg_len = strlen((char *)g_snd_buf);
-
-                err = R_USB_Write (&g_basic_ctrl, g_snd_buf, msg_len,
-                             event_info->device_address);
-                if (FSP_SUCCESS != err)
-                {
-                    handle_error (err, "**R_USB_Write API FAILED**");
-                }
             }
 
             /*Clear receive buffer*/
